@@ -148,7 +148,7 @@ python data/generate_patients.py
 
 ## tau2 Benchmark
 
-PRANA-Env ships with a [tau2](https://github.com/sierra-research/tau2-bench) benchmark suite that evaluates agent performance on:
+PRANA-Env ships with a [tau2](https://github.com/pbanavara/tau2-bench) benchmark suite that evaluates agent performance on:
 
 - **Temporal reasoning**: Correctly identifying stale vs. fresh labs across stochastic T1 ages
 - **Anomaly detection**: Catching >25% measurement deltas within 14 days per OPTN policy
