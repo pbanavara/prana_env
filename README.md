@@ -1,6 +1,6 @@
 ---
-title: Prana Env Environment Server
-emoji: 🏒
+title: PRANA-Env Environment Server
+emoji: 🏥
 colorFrom: purple
 colorTo: indigo
 sdk: docker
@@ -9,247 +9,174 @@ app_port: 8000
 base_path: /web
 tags:
   - openenv
+  - reinforcement-learning
+  - clinical
 ---
 
-# Prana Env Environment
+# PRANA-Env
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+**Policy Reinforced Administrative Navigation Agent** — an OpenEnv RL environment for kidney transplant administration.
 
-## Quick Start
+PRANA-Env simulates the multi-step clinical workflow required to file a KARS-compliant SRTR report for a transplant candidate. The agent must query fragmented datastores, detect stale lab values, and file a complete report — earning rewards from a deterministic KARS validator.
 
-The simplest way to use the Prana Env environment is through the `PranaEnv` class:
+## Architecture
+
+```
+LLM Agent (GPT-4o / fine-tuned model)
+        │
+        │  query_db / record_value / file_report
+        ▼
+  PranaEnv Client  ──(WebSocket)──  PranaEnvironment Server
+                                          │
+                                    KARS Validator
+                                    (reward signal)
+```
+
+## Action Space
+
+| Action | Required fields | Effect |
+|--------|----------------|--------|
+| `query_db` | `target`, `field`, `patient_id` | Returns current value from PatientDB |
+| `record_value` | `field`, `value` | Writes value into episode record with today's timestamp |
+| `file_report` | — | KARS validates record → reward → done |
+
+## Observation Space
+
+Every observation includes:
 
 ```python
-from prana_env import PranaAction, PranaEnv
-
-try:
-    # Create environment from Docker image
-    prana_envenv = PranaEnv.from_docker_image("prana_env-env:latest")
-
-    # Reset
-    result = prana_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
-
-    for msg in messages:
-        result = prana_envenv.step(PranaAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
-
-finally:
-    # Always clean up
-    prana_envenv.close()
-```
-
-That's it! The `PranaEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
-
-## Building the Docker Image
-
-Before using the environment, you need to build the Docker image:
-
-```bash
-# From project root
-docker build -t prana_env-env:latest -f server/Dockerfile .
-```
-
-## Deploying to Hugging Face Spaces
-
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
-
-```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
-```
-
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
-
-```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**PranaAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**PranaObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Prana Env environment server running, you can connect directly:
-
-```python
-from prana_env import PranaEnv
-
-# Connect to existing server
-prana_envenv = PranaEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = prana_envenv.reset()
-result = prana_envenv.step(PranaAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `prana_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from prana_env import PranaAction, PranaEnv
-
-# Connect with context manager (auto-connects and closes)
-with PranaEnv(base_url="http://localhost:8000") as env:
-    result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(PranaAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
-```
-
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
-
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    PranaEnvironment,  # Pass class, not instance
-    PranaAction,
-    PranaObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
+PranaObservation(
+    query_result      # str: value, NOT_FOUND, RECORDED, KARS status
+    active_task       # str: current task context (t1–t5)
+    recorded_fields   # dict: {field: {value, recorded_at}} — full current record
+    missing_fields    # list[str]: KARS issues after file_report
+    kars_result       # str | None: "PASSED" | "FAILED"
+    reward            # float
+    done              # bool
 )
 ```
 
-Then multiple clients can connect simultaneously:
+`recorded_fields` shows the agent its full current state including timestamps — enabling staleness detection and selective re-querying.
+
+## Reward Signal
+
+| Event | Reward |
+|-------|--------|
+| KARS PASSED — first attempt | **+15** |
+| KARS PASSED — after correction | **+10** |
+| Re-query of already-fresh field | **−1** |
+| KARS FAILED — missing or stale fields | **−5** |
+| KARS FAILED — unrecoverable (3 attempts) | **−10** |
+
+## Temporal Model (T1 → T5)
+
+Episodes simulate a 4-month clinical timeline:
+
+- **T1 (2025-11-07)**: Initial labs recorded. Snapshot pre-loaded into episode record on `reset()`.
+- **T5 (2026-03-07)**: Filing date. KARS requires time-sensitive fields within **90 days**.
+
+On `reset()`, the agent sees a pre-populated record with stale T1 values. It must:
+1. Identify which fields are stale (`hba1c`, `gfr`, `creatinine` — time-sensitive)
+2. Re-query only those fields to get current T5 values
+3. Leave stable fields (`blood_type`) untouched — re-querying incurs a penalty
+4. File when the record is complete and fresh
+
+**Example trajectory:**
+```
+reset() → record pre-loaded: {hba1c: {value: 7.2, recorded_at: 2025-11-07}, ...}
+
+query_db(hba1c)      → 8.9   (T5 value — GFR worsened)
+query_db(gfr)        → 12.1  (was 18.5 at T1)
+query_db(creatinine) → 4.7   (was 3.8 at T1)
+record_value × 3
+file_report()        → KARS PASSED, reward=+15
+```
+
+## Quick Start
+
+```bash
+# Start the server
+conda activate openenv
+uvicorn server.app:app --host 0.0.0.0 --port 8000
+```
 
 ```python
-from prana_env import PranaAction, PranaEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with PranaEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(PranaAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
+# Run the LLM agent loop
+python test_agent.py
 ```
 
-## Development & Testing
+```python
+# Run N episodes for GRPO rollout batch
+from test_agent import run_episodes
 
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
-
-```bash
-# From the server directory
-python3 server/prana_env_environment.py
+trajectories = run_episodes(
+    task="File a KARS-compliant SRTR report for patient P001. "
+         "A T1 record exists from 4 months ago. "
+         "Check which fields are stale, re-query only what's needed, and file.",
+    patient_id="P001",
+    n=8,  # GRPO batch size
+)
 ```
 
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
+## Patients
 
-### Running Locally
+| ID | Condition | T1 GFR | T5 GFR | HbA1c T1→T5 | Notes |
+|----|-----------|--------|--------|-------------|-------|
+| P001 | CKD Stage 4 | 18.5 | 12.1 | 7.2→8.9 | Complete record |
+| P002 | Diabetic nephropathy | 11.0 | 8.3 | 9.1→10.2 | Antihypertensives, insulin |
+| P003 | CKD Stage 3 | 22.3 | 19.8 | null | HbA1c never recorded, inactive waitlist |
 
-Run the server locally for development:
+## KARS Required Fields
 
-```bash
-uvicorn server.app:app --reload
-```
+| Field | Source | Time-sensitive |
+|-------|--------|---------------|
+| `hba1c` | PatientDB | Yes — 90-day window |
+| `gfr` | PatientDB | Yes — 90-day window |
+| `creatinine` | PatientDB | Yes — 90-day window |
+| `blood_type` | PatientDB | No — stable |
 
 ## Project Structure
 
 ```
 prana_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # PranaEnv client
-├── models.py              # Action and Observation models
+├── client.py                      # PranaEnv WebSocket client
+├── models.py                      # PranaAction, PranaObservation
+├── test_agent.py                  # LLM agent RL loop (GPT-4o)
+├── test_client.py                 # Smoke test client
+├── data/
+│   └── patient_db.json            # Patient records with T1 snapshots and T5 values
 └── server/
-    ├── __init__.py        # Server module exports
-    ├── prana_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+    ├── app.py                     # FastAPI + WebSocket server
+    ├── prana_env_environment.py   # RL environment: actions, KARS validator, rewards
+    └── Dockerfile
 ```
+
+## Connecting to an Existing Server
+
+```python
+from prana_env.client import PranaEnv
+from prana_env.models import PranaAction
+
+with PranaEnv(base_url="http://localhost:8000") as env:
+    result = env.reset(patient_id="P001")
+    print(result.observation.query_result)
+
+    result = env.step(PranaAction(action_type="query_db", target="PatientDB",
+                                  field="hba1c", patient_id="P001"))
+    print(result.observation.query_result)   # "8.9"
+    print(result.observation.recorded_fields)  # current record state
+```
+
+## Deploying to Hugging Face Spaces
+
+```bash
+openenv push
+# or
+openenv push --repo-id my-org/prana-env --private
+```
+
+After deployment:
+- **Web UI**: `/web`
+- **API docs**: `/docs`
+- **Health**: `/health`
+- **WebSocket**: `/ws`
