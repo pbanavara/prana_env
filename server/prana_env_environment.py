@@ -9,21 +9,22 @@ Minimal RL loop:
 Reward:
   +15  KARS PASSED on first attempt
   +10  KARS PASSED after prior failed attempt
-   +3  record_value with valid policy_ref (retroactive correction bonus — Phase 2)
    -1  query_db for a field already fresh in the record (inefficiency penalty)
    -5  file_report with missing or stale required fields
   -10  unrecoverable KARS failure (max filing attempts exceeded)
 
-Temporal model (T1 → T5, ~4 months):
-  - Episode resets with patient record pre-populated from T1 snapshot (2025-11-07)
-  - Current date is EPISODE_DATE (2026-03-07)
-  - Time-sensitive fields (hba1c, gfr, creatinine) must be recorded within
-    RECENCY_DAYS (90) of EPISODE_DATE to pass KARS
-  - Stable fields (blood_type, pra) have no recency requirement
-  - T1 snapshot values are 120 days old → stale → agent must re-query and re-record
+Stochasticity (4 sources):
+  1. T1 date randomization   — T1 age sampled Uniform(T1_AGE_MIN, T1_AGE_MAX) days
+                               Agent must calculate staleness dynamically, not memorize
+  2. Random patient selection — if no patient_id given, pick randomly from pool
+  3. Anomaly injection        — with ANOMALY_PROB, inject a spurious reading for one
+                               time-sensitive field; agent must detect and escalate
+  4. Field availability noise — with PENDING_PROB, a field returns PENDING on first
+                               query; resolved on retry (simulates data entry lag)
 """
 
 import logging
+import random
 from datetime import date, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -39,29 +40,32 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-# KARS required fields for v1 (PatientDB subset)
+# KARS required fields
 KARS_REQUIRED_FIELDS = ["hba1c", "gfr", "creatinine", "blood_type"]
-
-# Fields that must be within RECENCY_DAYS of filing date
 TIME_SENSITIVE_FIELDS = {"hba1c", "gfr", "creatinine"}
-
-# Stable fields — no recency requirement
 STABLE_FIELDS = {"blood_type", "pra"}
 
-# Max file_report attempts before unrecoverable failure
 MAX_FILE_ATTEMPTS = 3
 
 # Temporal constants
-EPISODE_DATE = date(2026, 3, 7)     # T5 filing date (today)
-T1_DATE = date(2025, 11, 7)         # T1 initial labs (~4 months ago)
-RECENCY_DAYS = 90                    # KARS recency requirement in days
+EPISODE_DATE = date(2026, 3, 7)
+RECENCY_DAYS = 90
+
+# ── Stochasticity parameters ──────────────────────────────────────────────────
+T1_AGE_MIN_DAYS = 60       # shortest possible T1 record age (fresh — no re-query needed)
+T1_AGE_MAX_DAYS = 150      # longest possible T1 record age (stale — must re-query)
+ANOMALY_PROB = 0.30        # probability of injecting anomalous reading per episode
+ANOMALY_DELTA = 0.40       # anomalous value deviates by this fraction from true T5
+ANOMALY_WINDOW_DAYS = 14   # anomaly detection window (matches OPTN Clinical Integrity Policy)
+ANOMALY_THRESHOLD = 0.25   # flag if delta > 25% within window
+PENDING_PROB = 0.15        # probability of PENDING response on first query of a field
 
 
 def kars_validate(record: dict) -> tuple[bool, list[str]]:
     """
     Deterministic KARS validator with recency checks.
-    record values are {"value": ..., "recorded_at": "YYYY-MM-DD"}.
-    Returns (passed, issues) where issues = missing fields + stale fields.
+    record values: {field: {"value": ..., "recorded_at": "YYYY-MM-DD"}}
+    Returns (passed, issues).
     """
     cutoff = EPISODE_DATE - timedelta(days=RECENCY_DAYS)
     issues = []
@@ -72,11 +76,10 @@ def kars_validate(record: dict) -> tuple[bool, list[str]]:
             issues.append(f"{f} (missing)")
             continue
         if f in TIME_SENSITIVE_FIELDS:
-            recorded_at_str = entry.get("recorded_at", "")
             try:
-                recorded_at = date.fromisoformat(recorded_at_str)
+                recorded_at = date.fromisoformat(entry.get("recorded_at", ""))
                 if recorded_at < cutoff:
-                    issues.append(f"{f} (stale: recorded {recorded_at_str}, must be after {cutoff})")
+                    issues.append(f"{f} (stale: recorded {recorded_at}, must be after {cutoff})")
             except ValueError:
                 issues.append(f"{f} (invalid date)")
 
@@ -87,14 +90,11 @@ class PranaEnvironment(Environment):
     """
     PRANA-Env: kidney transplant administration RL environment.
 
-    Episode flow:
-      reset()              → load patient, pre-populate T1 stale record
-      query_db(field)      → read current (T5) value from PatientDB
-      record_value(field)  → write value into episode record with today's date
-      file_report()        → KARS validate → reward → done=True on pass
-
-    The agent must detect that T1 values are stale and re-query time-sensitive
-    fields (hba1c, gfr, creatinine) before filing.
+    Stochastic per-episode:
+      - T1 record age varies (60–150 days) — agent must calculate recency dynamically
+      - Patient selected randomly if not specified
+      - One time-sensitive field may have an injected anomalous reading (30% episodes)
+      - Some fields return PENDING on first query (15% per field) — retry resolves
     """
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
@@ -106,6 +106,9 @@ class PranaEnvironment(Environment):
         self._patient_id: str | None = None
         self._patient_record: dict = {}
         self._file_attempts: int = 0
+        self._t1_date: date = EPISODE_DATE - timedelta(days=120)
+        self._pending_fields: set = set()
+        self._injected_anomaly: dict | None = None
         self._patient_db = self._load_db("patient_db.json")
         logger.info(f"{tag} Loaded PatientDB with {len(self._patient_db.get('patients', {}))} patients")
 
@@ -119,34 +122,67 @@ class PranaEnvironment(Environment):
 
     def reset(self, seed: int | None = None, episode_id: str | None = None, **kwargs) -> PranaObservation:
         patient_id: str | None = kwargs.get("patient_id")
+        patients = self._patient_db.get("patients", {})
+
+        # ── Stochasticity 2: random patient selection ─────────────────────────
+        if not patient_id:
+            patient_id = random.choice(list(patients.keys()))
+            logger.info(f"{tag} No patient_id specified — randomly selected {patient_id}")
+
         self._state = State(episode_id=episode_id or str(uuid4()), step_count=0)
         self._active_task = "t1"
         self._patient_id = patient_id
         self._patient_record = {}
         self._file_attempts = 0
+        self._pending_fields = set()
+        self._injected_anomaly = None
 
-        # Pre-populate record with T1 snapshot (stale — 120 days old)
-        if patient_id:
-            patients = self._patient_db.get("patients", {})
-            patient = patients.get(patient_id, {})
-            snapshot = patient.get("t1_snapshot", {})
-            t1_recorded_at = date.fromisoformat(snapshot.get("recorded_at", T1_DATE.isoformat()))
-            for field in KARS_REQUIRED_FIELDS:
-                val = snapshot.get(field)
-                if val is not None:
-                    self._patient_record[field] = self._make_entry(val, t1_recorded_at)
-
+        # ── Stochasticity 1: randomize T1 record age ──────────────────────────
+        t1_days_ago = random.randint(T1_AGE_MIN_DAYS, T1_AGE_MAX_DAYS)
+        self._t1_date = EPISODE_DATE - timedelta(days=t1_days_ago)
         cutoff = EPISODE_DATE - timedelta(days=RECENCY_DAYS)
-        logger.info(f"{tag} reset episode={self._state.episode_id} patient_id={patient_id} "
-                    f"pre_populated={list(self._patient_record.keys())}")
+        t1_is_stale = self._t1_date < cutoff
+
+        # Pre-populate record with T1 snapshot at randomized date
+        patient = patients.get(patient_id, {})
+        snapshot = patient.get("t1_snapshot", {})
+        for field in KARS_REQUIRED_FIELDS:
+            val = snapshot.get(field)
+            if val is not None:
+                self._patient_record[field] = self._make_entry(val, self._t1_date)
+
+        # ── Stochasticity 3: anomaly injection ────────────────────────────────
+        if random.random() < ANOMALY_PROB:
+            field = random.choice(sorted(TIME_SENSITIVE_FIELDS))
+            t5_value = patient.get(field)
+            if t5_value is not None:
+                direction = random.choice([-1, 1])
+                anomaly_value = round(t5_value * (1 + direction * ANOMALY_DELTA), 1)
+                anomaly_days = random.randint(1, 6)
+                self._injected_anomaly = {
+                    "field": field,
+                    "value": anomaly_value,
+                    "recorded_at": (EPISODE_DATE - timedelta(days=anomaly_days)).isoformat(),
+                }
+                logger.info(f"{tag} Injected anomaly: {self._injected_anomaly}")
+
+        logger.info(
+            f"{tag} reset episode={self._state.episode_id} patient={patient_id} "
+            f"t1_date={self._t1_date} t1_stale={t1_is_stale} "
+            f"anomaly={self._injected_anomaly}"
+        )
+
+        stale_note = (
+            f"T1 record is {'STALE (>90 days)' if t1_is_stale else 'FRESH (≤90 days)'}."
+        )
 
         return PranaObservation(
             query_result=(
-                f"Episode reset. Patient: {patient_id or 'not set'}. "
+                f"Episode reset. Patient: {patient_id}. "
                 f"Filing date: {EPISODE_DATE}. "
+                f"T1 record date: {self._t1_date} ({t1_days_ago} days ago). {stale_note} "
                 f"Required fields: {KARS_REQUIRED_FIELDS}. "
-                f"Time-sensitive fields {sorted(TIME_SENSITIVE_FIELDS)} must be recorded after {cutoff}. "
-                f"Pre-existing T1 record loaded (recorded {T1_DATE}) — check recency before filing."
+                f"Time-sensitive {sorted(TIME_SENSITIVE_FIELDS)} must be recorded after {cutoff}."
             ),
             active_task=self._active_task,
             recorded_fields=self._patient_record.copy(),
@@ -209,7 +245,7 @@ class PranaEnvironment(Environment):
             try:
                 recorded_at = date.fromisoformat(entry.get("recorded_at", ""))
                 if field in STABLE_FIELDS or recorded_at >= cutoff:
-                    logger.info(f"{tag} field={field} already fresh in record — inefficiency penalty")
+                    logger.info(f"{tag} field={field} already fresh — inefficiency penalty")
                     return PranaObservation(
                         query_result=f"ALREADY_RECORDED: '{field}' = {entry['value']} (recorded {entry['recorded_at']})",
                         active_task=self._active_task,
@@ -222,7 +258,6 @@ class PranaEnvironment(Environment):
 
         patients = self._patient_db.get("patients", {})
         patient = patients.get(patient_id)
-
         if not patient:
             return PranaObservation(
                 query_result=f"NOT_FOUND: patient '{patient_id}' not in PatientDB.",
@@ -231,6 +266,22 @@ class PranaEnvironment(Environment):
                 done=False,
                 reward=0.0,
             )
+
+        # ── Stochasticity 4: field availability noise (PENDING) ───────────────
+        if field in TIME_SENSITIVE_FIELDS and field not in self._pending_fields:
+            if random.random() < PENDING_PROB:
+                self._pending_fields.add(field)
+                logger.info(f"{tag} field={field} returned PENDING (will resolve on retry)")
+                return PranaObservation(
+                    query_result=(
+                        f"PENDING: '{field}' not yet entered for patient '{patient_id}'. "
+                        f"Data entry in progress — retry."
+                    ),
+                    active_task=self._active_task,
+                    recorded_fields=self._patient_record.copy(),
+                    done=False,
+                    reward=0.0,
+                )
 
         value = patient.get(field)
         if value is None:
@@ -242,14 +293,68 @@ class PranaEnvironment(Environment):
                 reward=0.0,
             )
 
+        # ── Stochasticity 3: include anomaly in history if injected ───────────
+        if field in TIME_SENSITIVE_FIELDS:
+            query_result = self._format_lab_history(field, patient_id, value)
+        else:
+            query_result = str(value)
+
         logger.info(f"{tag} query_db OK field={field} value={value}")
         return PranaObservation(
-            query_result=str(value),
+            query_result=query_result,
             active_task=self._active_task,
             recorded_fields=self._patient_record.copy(),
             done=False,
             reward=0.0,
         )
+
+    def _format_lab_history(self, field: str, patient_id: str, t5_value) -> str:
+        """
+        Format a time-sensitive field as a timestamped history.
+        Includes T1 snapshot entry, T5 current entry, and injected anomaly if present.
+        Flags anomalies per OPTN Clinical Integrity Policy.
+        """
+        snapshot = self._patient_db["patients"][patient_id].get("t1_snapshot", {})
+        t1_val = snapshot.get(field)
+
+        history: list[tuple[date, float]] = []
+        if t1_val is not None:
+            history.append((self._t1_date, float(t1_val)))
+
+        # Inject anomalous reading if this is the affected field
+        if self._injected_anomaly and self._injected_anomaly["field"] == field:
+            anom_date = date.fromisoformat(self._injected_anomaly["recorded_at"])
+            history.append((anom_date, self._injected_anomaly["value"]))
+
+        history.append((EPISODE_DATE, float(t5_value)))
+        history.sort(key=lambda x: x[0])
+
+        lines = []
+        for i, (d, v) in enumerate(history):
+            suffix = " ← latest" if i == len(history) - 1 else ""
+            lines.append(f"  {v} (recorded: {d}){suffix}")
+
+        result = (
+            f"{field} measurement history for {patient_id} "
+            f"(filing date: {EPISODE_DATE}):\n" + "\n".join(lines)
+        )
+
+        # Check for anomaly between consecutive entries within window
+        for i in range(len(history) - 1):
+            d1, v1 = history[i]
+            d2, v2 = history[i + 1]
+            days_apart = (d2 - d1).days
+            if days_apart <= ANOMALY_WINDOW_DAYS and v1 > 0:
+                change = abs(v2 - v1) / v1
+                if change >= ANOMALY_THRESHOLD:
+                    pct = round(change * 100, 1)
+                    result += (
+                        f"\n⚠️ ANOMALY DETECTED: {v1} ({d1}) → {v2} ({d2}), "
+                        f"{days_apart} days apart, {pct}% delta. "
+                        f"Recommend confirmatory test before filing."
+                    )
+
+        return result
 
     def _handle_record_value(self, action: PranaAction) -> PranaObservation:
         field = (action.field or "").lower()
@@ -265,14 +370,17 @@ class PranaEnvironment(Environment):
             )
 
         self._patient_record[field] = self._make_entry(value, EPISODE_DATE)
-        logger.info(f"{tag} record_value field={field} value={value} record={self._patient_record}")
+        logger.info(f"{tag} record_value field={field} value={value}")
 
         required_fresh = sum(
             1 for f in KARS_REQUIRED_FIELDS
             if f in self._patient_record and self._patient_record[f].get("value") is not None
         )
         return PranaObservation(
-            query_result=f"RECORDED: {field} = {value} (as of {EPISODE_DATE}). Record has {required_fresh}/{len(KARS_REQUIRED_FIELDS)} required fields.",
+            query_result=(
+                f"RECORDED: {field} = {value} (as of {EPISODE_DATE}). "
+                f"Record has {required_fresh}/{len(KARS_REQUIRED_FIELDS)} required fields."
+            ),
             active_task=self._active_task,
             recorded_fields=self._patient_record.copy(),
             done=False,
@@ -285,7 +393,7 @@ class PranaEnvironment(Environment):
 
         logger.info(
             f"{tag} file_report attempt={self._file_attempts} "
-            f"passed={passed} issues={issues} record={self._patient_record}"
+            f"passed={passed} issues={issues}"
         )
 
         if passed:
@@ -301,7 +409,6 @@ class PranaEnvironment(Environment):
                 reward=reward,
             )
 
-        # Unrecoverable failure
         if self._file_attempts >= MAX_FILE_ATTEMPTS:
             logger.warning(f"{tag} KARS FAILED unrecoverable after {self._file_attempts} attempts")
             return PranaObservation(
@@ -314,7 +421,6 @@ class PranaEnvironment(Environment):
                 reward=-10.0,
             )
 
-        # Recoverable failure
         logger.info(f"{tag} KARS FAILED recoverable issues={issues}")
         return PranaObservation(
             query_result=f"KARS FAILED. Issues: {issues}. Fix and file again.",
