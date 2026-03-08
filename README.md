@@ -97,7 +97,7 @@ file_report()        → KARS PASSED, reward=+15
 ```bash
 # Start the server
 conda activate openenv
-uvicorn server.app:app --host 0.0.0.0 --port 8000
+uvicorn server.app:app --host 0.0.0.0 --port 7860
 ```
 
 ```python
@@ -120,11 +120,27 @@ trajectories = run_episodes(
 
 ## Patients
 
-| ID | Condition | T1 GFR | T5 GFR | HbA1c T1→T5 | Notes |
-|----|-----------|--------|--------|-------------|-------|
-| P001 | CKD Stage 4 | 18.5 | 12.1 | 7.2→8.9 | Complete record |
-| P002 | Diabetic nephropathy | 11.0 | 8.3 | 9.1→10.2 | Antihypertensives, insulin |
-| P003 | CKD Stage 3 | 22.3 | 19.8 | null | HbA1c never recorded, inactive waitlist |
+50 procedurally generated patients (P001–P050) across CKD stages 3–5:
+
+| ID | Condition | Notes |
+|----|-----------|-------|
+| P001 | CKD Stage 4 | Complete record, anchor patient |
+| P002 | Diabetic nephropathy | Antihypertensives, insulin, anchor patient |
+| P003 | CKD Stage 3 | HbA1c not recorded (non-diabetic), anchor patient |
+| P004–P050 | CKD Stage 3/4/5 | Procedurally generated (seed=42) |
+
+**Patient distribution:**
+- CKD Stage 3: ~25% · Stage 4: ~50% · Stage 5: ~25%
+- 60% diabetic — HbA1c present; non-diabetics have 85% chance of missing HbA1c
+- ~10% of patients have an injected anomalous lab reading (>25% delta) for benchmark coverage
+
+**All patients include distractor fields** (queryable but not KARS-required):
+`cholesterol`, `bmi`, `albumin`, `hemoglobin`
+
+To regenerate the patient database:
+```bash
+python data/generate_patients.py
+```
 
 ## KARS Required Fields
 
@@ -143,10 +159,12 @@ prana_env/
 ├── models.py                      # PranaAction, PranaObservation
 ├── test_agent.py                  # LLM agent RL loop (GPT-4o)
 ├── test_client.py                 # Smoke test client
+├── prana_grpo_qwen3_8b_fp8.ipynb  # GRPO fine-tuning notebook (Qwen3-8B FP8, H100)
 ├── data/
-│   └── patient_db.json            # Patient records with T1 snapshots and T5 values
+│   ├── patient_db.json            # 50 patients with T1 snapshots, T5 values, distractor fields
+│   └── generate_patients.py      # Procedural patient generator (seed=42, CKD stage distributions)
 └── server/
-    ├── app.py                     # FastAPI + WebSocket server
+    ├── app.py                     # FastAPI + WebSocket server (port 7860)
     ├── prana_env_environment.py   # RL environment: actions, KARS validator, rewards
     └── Dockerfile
 ```
@@ -157,7 +175,7 @@ prana_env/
 from prana_env.client import PranaEnv
 from prana_env.models import PranaAction
 
-with PranaEnv(base_url="http://localhost:8000") as env:
+with PranaEnv(base_url="http://localhost:7860") as env:
     result = env.reset(patient_id="P001")
     print(result.observation.query_result)
 
