@@ -327,34 +327,18 @@ class PranaEnvironment(Environment):
             history.append((anom_date, self._injected_anomaly["value"]))
 
         history.append((EPISODE_DATE, float(t5_value)))
-        history.sort(key=lambda x: x[0])
 
-        lines = []
-        for i, (d, v) in enumerate(history):
-            suffix = " ← latest" if i == len(history) - 1 else ""
-            lines.append(f"  {v} (recorded: {d}){suffix}")
+        # Shuffle deterministically by (patient_id, field) — agent must sort by date.
+        # No ← latest pointer, no anomaly flag — matches tau2 benchmark behaviour.
+        rng = random.Random(hash((patient_id, field)) & 0xFFFFFFFF)
+        rng.shuffle(history)
 
-        result = (
+        lines = [f"  {v} (recorded: {d})" for d, v in history]
+
+        return (
             f"{field} measurement history for {patient_id} "
             f"(filing date: {EPISODE_DATE}):\n" + "\n".join(lines)
         )
-
-        # Check for anomaly between consecutive entries within window
-        for i in range(len(history) - 1):
-            d1, v1 = history[i]
-            d2, v2 = history[i + 1]
-            days_apart = (d2 - d1).days
-            if days_apart <= ANOMALY_WINDOW_DAYS and v1 > 0:
-                change = abs(v2 - v1) / v1
-                if change >= ANOMALY_THRESHOLD:
-                    pct = round(change * 100, 1)
-                    result += (
-                        f"\n⚠️ ANOMALY DETECTED: {v1} ({d1}) → {v2} ({d2}), "
-                        f"{days_apart} days apart, {pct}% delta. "
-                        f"Recommend confirmatory test before filing."
-                    )
-
-        return result
 
     def _handle_record_value(self, action: PranaAction) -> PranaObservation:
         field = (action.field or "").lower()
