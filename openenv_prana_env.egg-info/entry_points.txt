@@ -1,0 +1,2 @@
+[console_scripts]
+server = prana_env.server.app:main

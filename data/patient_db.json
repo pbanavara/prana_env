@@ -1,0 +1,58 @@
+{
+  "patients": {
+    "P001": {
+      "patient_id": "P001",
+      "name": "Jane Doe",
+      "age": 52,
+      "blood_type": "A+",
+      "hba1c": 8.9,
+      "gfr": 12.1,
+      "creatinine": 4.7,
+      "pra": 12,
+      "t1_snapshot": {
+        "hba1c": 7.2,
+        "gfr": 18.5,
+        "creatinine": 3.8,
+        "blood_type": "A+",
+        "pra": 12,
+        "recorded_at": "2025-11-07"
+      }
+    },
+    "P002": {
+      "patient_id": "P002",
+      "name": "John Smith",
+      "age": 61,
+      "blood_type": "O-",
+      "hba1c": 10.2,
+      "gfr": 8.3,
+      "creatinine": 6.1,
+      "pra": 45,
+      "t1_snapshot": {
+        "hba1c": 9.1,
+        "gfr": 11.0,
+        "creatinine": 5.2,
+        "blood_type": "O-",
+        "pra": 45,
+        "recorded_at": "2025-11-07"
+      }
+    },
+    "P003": {
+      "patient_id": "P003",
+      "name": "Maria Garcia",
+      "age": 47,
+      "blood_type": "B+",
+      "hba1c": null,
+      "gfr": 19.8,
+      "creatinine": 3.4,
+      "pra": 8,
+      "t1_snapshot": {
+        "hba1c": null,
+        "gfr": 22.3,
+        "creatinine": 3.1,
+        "blood_type": "B+",
+        "pra": 8,
+        "recorded_at": "2025-11-07"
+      }
+    }
+  }
+}
